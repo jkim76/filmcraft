@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{AutomationError, BridgeClient, png_rgba};
+use crate::{AutomationError, BridgeClient, Confinement, png_rgba};
 
 pub enum Backend {
     Headless(Arc<Mutex<Session>>),
@@ -38,6 +38,8 @@ pub struct FilmcraftMcp {
     /// Bridge `render_frame` moves the app's one playhead and screenshots the one Program monitor, so
     /// calls (which MCP clients may send in parallel) take turns instead of seeing each other's frame.
     render_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Headless only: the folders the agent may read and write (`None`: unconfined).
+    confinement: Option<Arc<Confinement>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -203,10 +205,24 @@ const MAX_QUEUED_PARSE_ERRORS: usize = 64;
 
 impl FilmcraftMcp {
     pub fn headless(session: Session) -> Self {
-        Self { backend: Arc::new(Backend::Headless(Arc::new(Mutex::new(session)))), render_lock: Arc::default(), tool_router: Self::tool_router() }
+        Self {
+            backend: Arc::new(Backend::Headless(Arc::new(Mutex::new(session)))),
+            render_lock: Arc::default(),
+            confinement: None,
+            tool_router: Self::tool_router(),
+        }
+    }
+    /// A headless server whose agent may only read and write files inside `confinement`'s roots.
+    pub fn headless_confined(session: Session, confinement: Confinement) -> Self {
+        Self { confinement: Some(Arc::new(confinement)), ..Self::headless(session) }
     }
     pub fn bridge(addr: &str) -> Result<Self, AutomationError> {
-        Ok(Self { backend: Arc::new(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))), render_lock: Arc::default(), tool_router: Self::tool_router() })
+        Ok(Self {
+            backend: Arc::new(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))),
+            render_lock: Arc::default(),
+            confinement: None,
+            tool_router: Self::tool_router(),
+        })
     }
 
     pub async fn serve_stdio(self) -> Result<(), AutomationError> {
@@ -278,6 +294,17 @@ impl FilmcraftMcp {
 
     /// Run an engine command on whichever backend.
     pub async fn run(&self, id: &str, params: Value) -> Result<Value, AutomationError> {
+        if let Some(c) = &self.confinement {
+            c.check(id, &params)?;
+            if id == "file.save" && params.get("path").is_none_or(Value::is_null) {
+                let project = Box::pin(self.run_unconfined("project.inspect", json!({}))).await?;
+                c.check_save_target(project.get("path").and_then(Value::as_str))?;
+            }
+        }
+        self.run_unconfined(id, params).await
+    }
+
+    async fn run_unconfined(&self, id: &str, params: Value) -> Result<Value, AutomationError> {
         match &*self.backend {
             Backend::Headless(s) => {
                 let s = s.clone();

@@ -14,9 +14,26 @@ FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 | Headless | `filmcraft-cli mcp --demo` or `--project p.fcproj` (neither = empty project) | an in-process engine session, no window |
 | Bridge | `filmcraft-cli mcp --bridge 127.0.0.1:9876` | the running desktop app started with `filmcraft --control 9876` |
 
-Headless mode also takes `--data-dir DIR` (user presets). Any other option is rejected (exit 2):
-there are no folder-confinement flags such as `--automation-read-root`, so the server can read
-and write wherever the user can.
+Headless mode also takes `--data-dir DIR` (user presets) and the folder-confinement flags
+`--automation-read-root DIR` and `--automation-write-root DIR` (each repeatable, as in PhotoCraft
+and EffectCraft). Without them the server can read and write wherever the user can. With them,
+every command the agent runs (`command_run`, each `command_batch` step, `media_import`) is
+checked before it runs (`crates/automation/src/confine.rs`):
+
+- files it reads must be absolute paths under a read or a write root, files it writes under a
+  write root: no `..`, symbolic links resolved; any other absolute path in its parameters
+  (nested settings too) counts as a read;
+- Save without a path writes the open project's file, which must be under a write root; Export
+  Frame, Quick Export, Add to Export Queue, Extract Audio and the speech commands need their
+  destination named instead of writing to a default folder;
+- Reveal in Finder, Auto-Save Now, Clean Media Cache and Make Offline with Delete Files are
+  refused;
+- `--project` must be under a root, and the flags are refused with `--bridge` (the live app's
+  session is not confined).
+
+Media an opened project already references is decoded from wherever it is: the check covers
+the paths an agent names, not paths stored inside project files. Any other option is rejected
+(exit 2).
 
 **Claude Code.** The repository's `.mcp.json` registers both servers (`filmcraft` = bridge,
 `filmcraft-headless` = demo). Both point at `target/release/filmcraft-cli`, so build it first:

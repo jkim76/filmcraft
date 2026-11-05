@@ -99,6 +99,11 @@ SUBCOMMANDS
                                 --image-sequence <media> is the first numbered still of a sequence
   bench-decode <media> [--frames N]
   mcp                           MCP server on stdio (headless, or --bridge to the live app)
+      [--automation-read-root DIR] [--automation-write-root DIR]
+                                headless only, each repeatable: the agent may read files only under
+                                a read or write root and write only under a write root (absolute
+                                paths, no `..`, links resolved); Reveal in Finder, auto-save, the
+                                media cache clean-up and Make Offline's Delete Files are refused
   help                          this text
   --version                     print the version
 
@@ -543,15 +548,31 @@ async fn cli_render(a: &Args) {
 }
 
 async fn cli_mcp(a: &Args) {
-    if let Some(opt) = a.unknown_opt(&["--bridge", "--project", "--demo", "--data-dir"]) {
+    if let Some(opt) = a.unknown_opt(&["--bridge", "--project", "--demo", "--data-dir", "--automation-read-root", "--automation-write-root"]) {
         usage(format!("unknown mcp option `{opt}`"));
     }
+    let to_paths = |k: &str| a.opts(k).into_iter().map(std::path::PathBuf::from).collect::<Vec<_>>();
+    let (read, write) = (to_paths("--automation-read-root"), to_paths("--automation-write-root"));
+    let confined = a.flag("--automation-read-root") || a.flag("--automation-write-root");
     let server = match a.opt("--bridge") {
+        // The app's own session reaches the user's files through its UI anyway; confining
+        // only the bridge would be a false promise.
+        Some(_) if confined => usage("mcp: --automation-read-root/--automation-write-root confine a headless server; they cannot be used with --bridge"),
         Some(addr) => filmcraft_automation::FilmcraftMcp::bridge(addr).unwrap_or_else(|e| usage(e)),
-        None => match Backend::open(a) {
-            Backend::Local(s) => filmcraft_automation::FilmcraftMcp::headless(*s),
-            Backend::Bridge(_) => usage("mcp: use --bridge ADDR to drive a running app"),
-        },
+        None => {
+            // A project opened at start-up is read before the agent connects: inside a root too.
+            let confinement = confined.then(|| filmcraft_automation::Confinement::new(&read, &write).unwrap_or_else(|e| usage(format!("mcp: {e}"))));
+            if let (Some(c), Some(p)) = (&confinement, a.opt("--project"))
+                && !c.allows(std::path::Path::new(p), filmcraft_automation::confine::Access::Read)
+            {
+                usage(format!("mcp: --project {p} is outside the automation roots (give its absolute path inside one)"));
+            }
+            match (Backend::open(a), confinement) {
+                (Backend::Local(s), Some(c)) => filmcraft_automation::FilmcraftMcp::headless_confined(*s, c),
+                (Backend::Local(s), None) => filmcraft_automation::FilmcraftMcp::headless(*s),
+                (Backend::Bridge(_), _) => usage("mcp: use --bridge ADDR to drive a running app"),
+            }
+        }
     };
     if let Err(e) = server.serve_stdio().await {
         fail(format!("mcp: {e}"));

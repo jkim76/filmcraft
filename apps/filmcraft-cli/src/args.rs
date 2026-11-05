@@ -23,6 +23,8 @@ const VALUED: &[&str] = &[
     "--data-dir",
     "--settings",
     "--gpu-rendering",
+    "--automation-read-root",
+    "--automation-write-root",
 ];
 
 #[derive(Debug, Default)]
@@ -58,6 +60,11 @@ impl Args {
 
     pub fn opt(&self, k: &str) -> Option<&str> {
         self.opts.iter().rev().find(|(n, _)| n == k).and_then(|(_, v)| v.as_deref())
+    }
+
+    /// Every value of a repeatable option, in order (`--automation-read-root A --automation-read-root B`).
+    pub fn opts(&self, k: &str) -> Vec<&str> {
+        self.opts.iter().filter(|(n, _)| n == k).filter_map(|(_, v)| v.as_deref()).collect()
     }
 
     pub fn flag(&self, k: &str) -> bool {
@@ -178,8 +185,17 @@ mod tests {
     fn unknown_opt_reports_first_unlisted_option() {
         let allowed = ["--bridge", "--project"];
         assert_eq!(args("mcp --automation-read-root X").unknown_opt(&allowed), Some("--automation-read-root"));
+        assert_eq!(args("mcp --automation-read-root X --typo").unknown_opt(&["--automation-read-root"]), Some("--typo"));
         assert_eq!(args("mcp --bridge=a --typo=1").unknown_opt(&allowed), Some("--typo"));
         assert_eq!(args("mcp --project p --bridge a").unknown_opt(&allowed), None);
+    }
+
+    #[test]
+    fn repeatable_roots_keep_every_value() {
+        let a = args("mcp --automation-read-root /a --automation-write-root /out --automation-read-root=/b");
+        assert_eq!(a.opts("--automation-read-root"), ["/a", "/b"]);
+        assert_eq!(a.opts("--automation-write-root"), ["/out"]);
+        assert!(a.positionals == ["mcp"], "{:?}", a.positionals);
     }
 
     #[test]

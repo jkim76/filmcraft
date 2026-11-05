@@ -7,14 +7,18 @@
 //! * **Bridge** mode forwards to a running desktop app over the JSON-lines control channel
 //!   (`filmcraft --control <port>`), so agents can also inspect, screenshot, click, drag, scroll
 //!   and type in the live UI — every menu, panel, timeline gesture and keystroke.
+//! * **Confinement** ([`Confinement`]): a headless server started with read/write roots only
+//!   lets the agent read and write files inside them.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod bridge;
+pub mod confine;
 pub mod long_job;
 pub mod server;
 
 pub use bridge::BridgeClient;
+pub use confine::Confinement;
 pub use server::FilmcraftMcp;
 
 #[derive(Debug, thiserror::Error)]

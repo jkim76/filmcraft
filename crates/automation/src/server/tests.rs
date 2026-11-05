@@ -502,3 +502,51 @@ async fn failed_output_stops_the_reader() {
     let ended = tokio::time::timeout(std::time::Duration::from_secs(30), server).await;
     assert!(ended.is_ok(), "the server kept reading after its output failed");
 }
+
+/// A confined headless server (`--automation-read-root/--automation-write-root`) checks every
+/// command it runs, also inside `command_batch`, and Save without a path writes the project's
+/// own file only when that is inside a write root.
+#[tokio::test]
+async fn confined_server_keeps_files_inside_the_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    for d in ["in", "out", "other"] {
+        std::fs::create_dir(base.join(d)).unwrap();
+    }
+    let at = |rel: &str| base.join(rel).to_string_lossy().into_owned();
+    let c = Confinement::new(&[base.join("in")], &[base.join("out")]).unwrap();
+    let m = FilmcraftMcp::headless_confined(demo(), c);
+
+    let e = m.run("file.saveAs", json!({"path": at("other/p.fcproj")})).await.unwrap_err();
+    assert!(e.to_string().contains("outside the write roots"), "{e}");
+    assert!(!base.join("other/p.fcproj").exists());
+    // the demo project has no file yet: Save needs a path
+    assert!(m.run("file.save", json!({})).await.is_err());
+    m.run("file.saveAs", json!({"path": at("out/p.fcproj")})).await.unwrap();
+    m.run("file.save", json!({})).await.unwrap();
+    assert!(base.join("out/p.fcproj").exists());
+    assert!(m.run("file.open", json!({"path": "/etc/hosts"})).await.is_err());
+    assert!(m.run("file.reveal", json!({})).await.is_err());
+
+    let batch = BatchParams {
+        steps: vec![
+            serde_json::from_value(json!({"id": "file.saveCopy", "params": {"path": at("out/copy.fcproj")}})).unwrap(),
+            serde_json::from_value(json!({"id": "file.saveCopy", "params": {"path": at("other/copy.fcproj")}})).unwrap(),
+        ],
+        stop_on_error: Some(false),
+    };
+    let r = m.command_batch(Parameters(batch)).await.unwrap();
+    assert_eq!(r.is_error, Some(true));
+    assert!(base.join("out/copy.fcproj").exists());
+    assert!(!base.join("other/copy.fcproj").exists());
+}
+
+/// Without roots nothing changes: the server reads and writes where the user can.
+#[tokio::test]
+async fn unconfined_server_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = FilmcraftMcp::headless(demo());
+    let p = dir.path().join("anywhere.fcproj");
+    m.run("file.saveAs", json!({"path": p.to_string_lossy()})).await.unwrap();
+    assert!(p.exists());
+}
