@@ -213,8 +213,12 @@ impl FilmcraftMcp {
         }
     }
     /// A headless server whose agent may only read and write files inside `confinement`'s roots.
-    pub fn headless_confined(session: Session, confinement: Confinement) -> Self {
-        Self { confinement: Some(Arc::new(confinement)), ..Self::headless(session) }
+    /// Every file the engine writes through its host services must be inside a write root too
+    /// ([`crate::confine::ConfinedServices`]).
+    pub fn headless_confined(mut session: Session, confinement: Confinement) -> Self {
+        let confinement = Arc::new(confinement);
+        session.services = Arc::new(crate::confine::ConfinedServices::new(session.services.clone(), confinement.clone()));
+        Self { confinement: Some(confinement), ..Self::headless(session) }
     }
     pub fn bridge(addr: &str) -> Result<Self, AutomationError> {
         Ok(Self {

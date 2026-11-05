@@ -15,10 +15,18 @@
 //! - commands that act outside the project or delete files ([`REFUSED`], Make Offline with
 //!   Delete Files) are refused.
 //!
+//! Second line of defence: [`ConfinedServices`] wraps the session's host services so every
+//! file the engine writes through them (`Services::write_file`/`write_file_new`) must be inside
+//! a write root, whichever command, alias or parameter named it (or none did, as with XMP
+//! sidecars next to media).
+//!
 //! Known limit: media that an opened project already references is decoded from wherever it
 //! is; confinement checks the paths an agent names, not paths stored inside project files.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use filmcraft_engine::Services;
 
 use serde_json::Value;
 
@@ -91,6 +99,8 @@ pub const WRITES: &[(&str, &[&str])] = &[
     ("lut.export", &["path"]),
     ("lumetri.presetThumbnails", &["path"]),
     ("graphics.template.export", &["path"]),
+    ("file.exportGraphicsTemplate", &["path"]),
+    ("file.projectManager", &["destination"]),
     ("graphics.template.thumbnail", &["path"]),
     ("shortcuts.export", &["path"]),
     ("presets.export", &["path"]),
@@ -114,6 +124,10 @@ pub const NEEDS_DESTINATION: &[(&str, &str)] = &[
     ("clip.extractAudio", "dir"),
     ("tts.create", "dir"),
     ("tts.edit", "dir"),
+    // Without `path` a graphics template goes to the app's data folder.
+    ("graphics.template.export", "path"),
+    ("file.exportGraphicsTemplate", "path"),
+    ("file.projectManager", "destination"),
 ];
 
 /// Parameters that hold text, names or vertices, never file paths: not checked as paths even
@@ -171,7 +185,9 @@ impl Confinement {
             ));
         }
         for (cmd, key) in NEEDS_DESTINATION {
-            if *cmd == id && params.get(*key).is_none_or(Value::is_null) {
+            // An empty string is no destination: the engine would write beside the server's
+            // working folder.
+            if *cmd == id && params.get(*key).and_then(Value::as_str).is_none_or(str::is_empty) {
                 return Err(AutomationError::BadRequest(format!("`{id}`: give `{key}` (inside a write root) while file access is confined")));
             }
         }
@@ -216,7 +232,9 @@ impl Confinement {
                 if !declared && (NOT_PATHS.contains(&key) || !looks_absolute) {
                     return Ok(());
                 }
-                if s.is_empty() && declared {
+                // An empty read path means "none" (e.g. clear a LUT); an empty write path would
+                // resolve against the server's working folder, so it is checked (and refused).
+                if s.is_empty() && declared && access == Access::Read {
                     return Ok(());
                 }
                 if self.allows(Path::new(s), access) {
@@ -238,6 +256,72 @@ impl Confinement {
             }),
             _ => Ok(()),
         }
+    }
+}
+
+/// The session's host services with every write confined to the write roots ([`Confinement`]).
+/// Reads pass through: the command table checks the paths an agent names, and media an opened
+/// project references is read where it is (the known limit above).
+pub struct ConfinedServices {
+    inner: Arc<dyn Services>,
+    confinement: Arc<Confinement>,
+}
+
+impl ConfinedServices {
+    pub fn new(inner: Arc<dyn Services>, confinement: Arc<Confinement>) -> Self {
+        Self { inner, confinement }
+    }
+
+    fn check_write(&self, path: &str) -> std::io::Result<()> {
+        if self.confinement.allows(Path::new(path), Access::Write) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{path} is outside the write roots; file access is confined (--automation-write-root, absolute paths inside it)"),
+            ))
+        }
+    }
+}
+
+impl Services for ConfinedServices {
+    fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        self.inner.read_file(path)
+    }
+    fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+        self.check_write(path)?;
+        self.inner.write_file(path, data)
+    }
+    fn write_file_new(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+        self.check_write(path)?;
+        self.inner.write_file_new(path, data)
+    }
+    fn file_size(&self, path: &str) -> std::io::Result<u64> {
+        self.inner.file_size(path)
+    }
+    fn read_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        self.inner.read_range(path, offset, len)
+    }
+    fn reader(&self, path: &str) -> Option<std::io::Result<filmcraft_media::SharedReader>> {
+        self.inner.reader(path)
+    }
+    fn list_dir(&self, dir: &str) -> Option<std::io::Result<Vec<String>>> {
+        self.inner.list_dir(dir)
+    }
+    fn file_loader(&self) -> Option<filmcraft_media::sequence::FrameLoader> {
+        self.inner.file_loader()
+    }
+    fn export_in_memory(&self) -> bool {
+        self.inner.export_in_memory()
+    }
+    fn list_entries(&self, dir: &str) -> Option<std::io::Result<Vec<filmcraft_engine::media_browser::DirEntry>>> {
+        self.inner.list_entries(dir)
+    }
+    fn volumes(&self) -> Vec<filmcraft_engine::media_browser::Volume> {
+        self.inner.volumes()
+    }
+    fn home_dir(&self) -> Option<String> {
+        self.inner.home_dir()
     }
 }
 
@@ -361,6 +445,47 @@ mod tests {
         assert!(r.c.check("export.quick", &json!({"path": p(&r, "out/q.mp4")})).is_ok());
         assert!(r.c.check("clip.extractAudio", &json!({"dir": p(&r, "out")})).is_ok());
         assert!(r.c.check("clip.extractAudio", &json!({})).is_err());
+    }
+
+    #[test]
+    fn empty_write_destinations_are_refused() {
+        let r = roots();
+        // "" would resolve against the server's working folder
+        assert!(r.c.check("export.quick", &json!({"path": ""})).is_err());
+        assert!(r.c.check("clip.extractAudio", &json!({"dir": ""})).is_err());
+        assert!(r.c.check("file.exportFrame", &json!({"path": ""})).is_err());
+        assert!(r.c.check("file.saveAs", &json!({"path": ""})).is_err());
+        assert!(r.c.check("export.quick", &json!({"path": 3})).is_err(), "a non-string is no destination");
+        // an empty read path still means "none"
+        assert!(r.c.check("lumetri.setInputLut", &json!({"path": ""})).is_ok());
+    }
+
+    #[test]
+    fn graphics_template_alias_and_project_manager_are_writes() {
+        let r = roots();
+        for id in ["file.exportGraphicsTemplate", "graphics.template.export"] {
+            assert!(r.c.check(id, &json!({"path": p(&r, "in/t.fcgt")})).is_err(), "{id}: a read root is not writable");
+            assert!(r.c.check(id, &json!({"path": "t.fcgt"})).is_err(), "{id}: relative");
+            assert!(r.c.check(id, &json!({})).is_err(), "{id}: the app's data folder");
+            assert!(r.c.check(id, &json!({"path": p(&r, "out/t.fcgt")})).is_ok(), "{id}");
+        }
+        assert!(r.c.check("file.projectManager", &json!({"destination": p(&r, "in/collected")})).is_err());
+        assert!(r.c.check("file.projectManager", &json!({"destination": "collected"})).is_err());
+        assert!(r.c.check("file.projectManager", &json!({"destination": p(&r, "out/collected")})).is_ok());
+    }
+
+    #[test]
+    fn confined_services_refuse_writes_outside_the_write_roots() {
+        let r = roots();
+        let svc = ConfinedServices::new(Arc::new(filmcraft_engine::FsServices), Arc::new(r.c.clone()));
+        assert!(svc.write_file(&p(&r, "out/a.xmp"), b"x").is_ok());
+        for bad in [p(&r, "in/a.xmp"), p(&r, "other/a.xmp"), p(&r, "out/../other/a.xmp"), "a.xmp".to_string(), String::new()] {
+            let e = svc.write_file(&bad, b"x").unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{bad}");
+            assert!(svc.write_file_new(&bad, b"x").is_err(), "{bad}");
+        }
+        assert!(!r.base.join("in/a.xmp").exists() && !r.base.join("other/a.xmp").exists());
+        assert_eq!(svc.read_file(&p(&r, "out/a.xmp")).unwrap(), b"x");
     }
 
     #[test]
